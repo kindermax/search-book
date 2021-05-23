@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::iter::FromIterator;
 
 #[derive(Debug)]
 struct InvertedIndex {
@@ -7,6 +8,8 @@ struct InvertedIndex {
     curr_doc_id: usize,
 }
 
+// A collection of documents ids
+type Posting = Vec<usize>;
 
 #[derive(Debug, PartialEq)]
 enum Token {
@@ -17,6 +20,7 @@ enum Token {
     Word(String),
 }
 
+/// Tokenize using https://en.wikipedia.org/wiki/Shunting-yard_algorithm
 fn tokenize(raw: &str) -> Result<Vec<Token>, String> {
     let mut tokens: Vec<Token> = vec![];
         let mut buf = String::new();
@@ -87,23 +91,6 @@ impl Query {
     fn new(raw_query: &str) -> Result<Query, String> {
         let tokens = tokenize(raw_query)?;
 
-        fn make_node(stack_ops: &mut Vec<Token>, stack_ast: &mut Vec<AstNode>) -> Result<AstNode, String> {
-            let left = stack_ast.pop().unwrap();
-            let right = stack_ast.pop().unwrap();
-            let node = match stack_ops.pop().unwrap() {
-                Token::Or => {
-                    AstNode::or(vec![left, right])
-                },
-                Token::And => {
-                    AstNode::and(vec![left, right])
-                }
-                _ => unreachable!()
-            };
-            stack_ops.pop();
-
-            Ok(node)
-        }
-
         let mut stack_ops = Vec::<Token>::new();
         let mut stack_ast = Vec::<AstNode>::new();
 
@@ -113,7 +100,7 @@ impl Query {
                     stack_ops.push(token);
                 }
                 Token::ClosePar => {
-                    let node  = make_node(&mut stack_ops, &mut stack_ast)?;
+                    let node  = Self::make_node(&mut stack_ops, &mut stack_ast)?;
                     stack_ast.push(node);
                 }
                 Token::Word(word) => {
@@ -122,22 +109,41 @@ impl Query {
             }
         }
 
-        let node  = make_node(&mut stack_ops, &mut stack_ast)?;
+        let node  = Self::make_node(&mut stack_ops, &mut stack_ast)?;
 
         Ok(Query { ast: node })
     }
+
+    fn make_node(stack_ops: &mut Vec<Token>, stack_ast: &mut Vec<AstNode>) -> Result<AstNode, String> {
+        let left = stack_ast.pop().unwrap();
+        let right = stack_ast.pop().unwrap();
+        let node = match stack_ops.pop().unwrap() {
+            Token::Or => {
+                AstNode::or(vec![left, right])
+            },
+            Token::And => {
+                AstNode::and(vec![left, right])
+            }
+            _ => unreachable!()
+        };
+        stack_ops.pop();
+
+        Ok(node)
+    }
 }
+
 
 
 impl InvertedIndex {
     fn new() -> Self {
         Self {
             index: HashMap::new(),
-            curr_doc_id: 0,
+            curr_doc_id: 1,
         }
     }
 
     /// Adding(indexing) a document to an index.
+    /// TODO postings needs to be sorted
     fn add_doc(&mut self, doc: String) {
         let next_doc_id = self.curr_doc_id;
         for word in doc.split(" ") {
@@ -153,33 +159,59 @@ impl InvertedIndex {
         self.index.keys().len()
     }
 
-    fn search_word(&self, word: &str) -> Option<Vec<usize>> {
-        self.index.get(word).and_then(|val| Some(val.clone()))
+    fn get_word_docs(&self, word: &str) -> Vec<usize> {
+        match self.index.get(word) {
+            Some(docs) => docs.iter().cloned().collect(), // TODO how not to clone
+            None => vec![],
+        }
     }
 
-    fn search(&self, query: Query) -> Result<Vec<usize>, String> {
-        let result = self.index
-            .iter()
-            .filter_map(|(key, docs)| {
-                // if query.conj.contains(key) {
-                //     Some(HashSet::from_iter(docs.iter().cloned()))
-                // } else {
-                //     None
-                // }
-                None
-            })
-            .fold(HashSet::new(), |acc, item| {
+    fn process_ast(&self, node: &AstNode) -> Vec<usize> {
+        match node {
+            AstNode::Or { nodes } => {
+                let postings = nodes
+                    .iter()
+                    .map(|n| self.process_ast(n))
+                    .collect::<Vec<Posting>>();
+
+                self.search_or(postings)
+            },
+            AstNode::Word(word) => {
+                self.get_word_docs(word.as_str())
+            },
+            AstNode::And { nodes } => {
+                let postings = nodes.iter().map(|n| {
+                    self.process_ast(n)
+                }).collect();
+
+                self.search_and(postings)
+            }
+        }
+    }
+
+    fn search_or(&self, postings: Vec<Posting>) -> Posting {
+        postings.iter().flatten().cloned().collect()
+    }
+
+    fn search_and(&self, postings: Vec<Posting>) -> Posting {
+        postings.iter()
+            .fold(HashSet::new(), |acc, docs| {
+                let docs_set = HashSet::from_iter(docs.iter().cloned());
                 if acc.is_empty() {
-                    item
+                    docs_set
                 } else {
-                    acc.intersection(&item).copied().collect()
+                    acc.intersection(&docs_set).copied().collect()
                 }
             })
             .into_iter()
-            .collect();
+            .collect()
+    }
+
+    fn search(&self, query: Query) -> Result<Vec<usize>, String> {
+        let mut result = self.process_ast(&query.ast);
+        result.sort();
 
         Ok(result)
-
     }
 }
 
@@ -205,7 +237,7 @@ mod tests {
         index.add_doc("july new home sales rise".to_string());
 
         assert_eq!(index.words(), 9);
-        assert_eq!(index.search_word("home"), Some(vec![0, 1, 2, 3]));
+        assert_eq!(index.get_word_docs("home"), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -216,8 +248,18 @@ mod tests {
         index.add_doc("increase in home sales in july".to_string());
         index.add_doc("july new home sales rise".to_string());
 
-        // TODO query use .into()
-        assert_eq!(index.search(Query::new("home AND rise").unwrap()), Ok(vec![1, 3]));
+        assert_eq!(index.search(Query::new("home AND rise").unwrap()), Ok(vec![2, 4]));
+    }
+
+    #[test]
+    fn test_search2() {
+        let mut index = InvertedIndex::new();
+        index.add_doc("new home sales to forecasts".to_string());
+        index.add_doc("home sales rise in july".to_string());
+        index.add_doc("increase in home sales in july".to_string());
+        index.add_doc("july new home sales rise".to_string());
+
+        assert_eq!(index.search(Query::new("(july AND rise) OR to").unwrap()), Ok(vec![1, 2, 4]));
     }
 
     #[test]
